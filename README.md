@@ -50,12 +50,14 @@ Each SQL tool takes a `database` argument holding a configured alias; an empty `
 
 Configure databases in a YAML file. Resolution order: `--config <path>` flag, then `SQLDB_MCP_CONFIG` env, then an auto-loaded `./sqldb-mcp.yaml` if present. With no config the server still starts (empty registry; `ping` and `list_databases` work, other SQL tools return a clear error).
 
+`${VAR}` tokens in scalar values are replaced with the value of the environment variable `VAR` after the YAML is parsed, so secrets stay out of the checked-in file. An unset variable resolves to an empty string; if that empties a required field (e.g. `url`), startup rejects it. The notation has no default-value or escape syntax.
+
 ```yaml
 # sqldb-mcp.yaml — every setting lives on its database entry; no defaults block.
 databases:
   primary:                       # alias used as the `database` tool argument
     driver: postgres
-    url: postgresql://user:pass@host:5432/appdb?sslmode=disable
+    url: postgresql://user:${DB_PASSWORD}@host:5432/appdb?sslmode=disable   # secret from env
     readonly: true               # default true; tools refuse writes
     max_open_conns: 10
     max_idle_conns: 5
@@ -64,7 +66,7 @@ databases:
     row_limit: 100
   warehouse:
     driver: postgres
-    url: postgresql://user:pass@host:5432/warehouse?sslmode=disable
+    url: postgresql://user:${DB_PASSWORD}@host:5432/warehouse?sslmode=disable
     readonly: false             # unrestricted: tools may run write statements
 ```
 

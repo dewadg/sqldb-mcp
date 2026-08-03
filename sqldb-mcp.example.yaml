@@ -11,7 +11,11 @@
 databases:
   primary:
     driver: postgres
-    url: postgresql://user:pass@localhost:5432/appdb?sslmode=disable
+    # ${VAR} tokens in scalar values are substituted from the environment after
+    # the YAML is parsed, so secrets like the password need not live in this
+    # file. An unset variable resolves to an empty string; an emptied required
+    # field (e.g. url) is rejected at startup.
+    url: postgresql://user:${DB_PASSWORD}@localhost:5432/appdb?sslmode=disable
     readonly: true          # default; execute_query refuses writes
     query_timeout: 30s
     row_limit: 100
