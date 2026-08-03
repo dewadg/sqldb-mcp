@@ -1,0 +1,12 @@
+schema: spec-driven
+
+rules:
+  proposal:
+   - Keep proposals under 500 words
+   - Always include a "Non-goals" section
+  design:
+    - Include section Flow with Mermaid diagram (if applicable)
+    - Include section Configuration when new/updated configuration is introduced
+    - Include section Test Scenario (if applicable)
+  tasks:
+   - Include documentation update (README.md, CLAUDE.md, .env.example, etc)
