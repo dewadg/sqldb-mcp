@@ -135,13 +135,14 @@ func setupFixture(t *testing.T, dsn string, seedCount int) *sql.DB {
 // --- server + client bootstrap -----------------------------------------
 
 // harness wires a real server (server.New) to an SDK client over an in-memory
-// transport and returns a ready client session plus a cleanup. The returned
-// registry handle is closed in cleanup after the server's Run goroutine exits.
-func harness(t *testing.T, dsn string, rowLimit int) *mcp.ClientSession {
+// transport and returns a ready client session plus a cleanup. readonly sets the
+// configured database's read-only flag. The returned registry handle is closed
+// in cleanup after the server's Run goroutine exits.
+func harness(t *testing.T, dsn string, rowLimit int, readonly bool) *mcp.ClientSession {
 	t.Helper()
 
 	dbCfg := db.Config{Databases: map[string]db.DatabaseConfig{
-		"primary": {Driver: "postgres", URL: dsn, RowLimit: &rowLimit},
+		"primary": {Driver: "postgres", URL: dsn, RowLimit: &rowLimit, Readonly: &readonly},
 	}}
 	dbCfg.ApplyDefaults()
 
@@ -225,7 +226,7 @@ func decode(t *testing.T, text string, out any) {
 func TestE2E_ListDatabases(t *testing.T) {
 	dsn := testDSN(t)
 	setupFixture(t, dsn, 0)
-	session := harness(t, dsn, db.DefaultRowLimit)
+	session := harness(t, dsn, db.DefaultRowLimit, true)
 
 	var out tools.ListDatabasesOutput
 	decode(t, callText(t, session, "list_databases", map[string]any{}), &out)
@@ -244,7 +245,7 @@ func TestE2E_ListDatabases(t *testing.T) {
 func TestE2E_ListObjects(t *testing.T) {
 	dsn := testDSN(t)
 	setupFixture(t, dsn, 0)
-	session := harness(t, dsn, db.DefaultRowLimit)
+	session := harness(t, dsn, db.DefaultRowLimit, true)
 
 	type args struct {
 		typ string
@@ -287,7 +288,7 @@ func TestE2E_ListObjects(t *testing.T) {
 func TestE2E_GetObjectDetails(t *testing.T) {
 	dsn := testDSN(t)
 	setupFixture(t, dsn, 0)
-	session := harness(t, dsn, db.DefaultRowLimit)
+	session := harness(t, dsn, db.DefaultRowLimit, true)
 
 	var out tools.GetObjectDetailsOutput
 	decode(t, callText(t, session, "get_object_details", map[string]any{
@@ -314,7 +315,7 @@ func TestE2E_ExecuteQuery(t *testing.T) {
 	const rowLimit = 5
 	dsn := testDSN(t)
 	pool := setupFixture(t, dsn, 25)
-	session := harness(t, dsn, rowLimit)
+	session := harness(t, dsn, rowLimit, true)
 
 	type args struct {
 		query string
@@ -373,12 +374,63 @@ func TestE2E_ExecuteQuery(t *testing.T) {
 	assert.Equal(t, 25, n, "readonly transaction must not have deleted rows")
 }
 
+// --- execute_query writes (readonly: false) ----------------------------
+
+func TestE2E_ExecuteQuery_Write(t *testing.T) {
+	dsn := testDSN(t)
+	pool := setupFixture(t, dsn, 1) // seed id=1 so a duplicate-PK write can fail
+	session := harness(t, dsn, db.DefaultRowLimit, false)
+
+	count := func() int {
+		var n int
+		assert.NoError(t, pool.QueryRowContext(context.Background(),
+			"SELECT count(*) FROM "+testSchema+".t_item").Scan(&n))
+		return n
+	}
+
+	t.Run("write succeeds and persists", func(t *testing.T) {
+		before := count()
+		var out tools.ExecuteQueryOutput
+		decode(t, callText(t, session, "execute_query", map[string]any{
+			"database": "primary",
+			"query":    "INSERT INTO " + testSchema + ".t_item(id) VALUES ($1)",
+			"args":     []any{42},
+		}), &out)
+		assert.Equal(t, int64(1), out.RowsAffected, "expected one affected row")
+		assert.Empty(t, out.Columns, "write result has no columns")
+		assert.Equal(t, before+1, count(), "row must be durable after commit")
+	})
+
+	t.Run("write rolled back on error", func(t *testing.T) {
+		before := count()
+		res := callResult(t, session, "execute_query", map[string]any{
+			"database": "primary",
+			"query":    "INSERT INTO " + testSchema + ".t_item(id) VALUES ($1)",
+			"args":     []any{1}, // duplicate PK
+		})
+		assert.True(t, res.IsError, "duplicate-PK insert must error")
+		assert.Equal(t, before, count(), "failed write must not change the table")
+	})
+
+	t.Run("select under readwrite still returns rows and does not persist", func(t *testing.T) {
+		before := count()
+		var out tools.ExecuteQueryOutput
+		decode(t, callText(t, session, "execute_query", map[string]any{
+			"database": "primary",
+			"query":    "SELECT id FROM " + testSchema + ".t_item",
+		}), &out)
+		assert.NotEmpty(t, out.Rows)
+		assert.NotEmpty(t, out.Columns)
+		assert.Equal(t, before, count(), "select must not change the table")
+	})
+}
+
 // --- explain_query ------------------------------------------------------
 
 func TestE2E_ExplainQuery(t *testing.T) {
 	dsn := testDSN(t)
 	setupFixture(t, dsn, 1)
-	session := harness(t, dsn, db.DefaultRowLimit)
+	session := harness(t, dsn, db.DefaultRowLimit, true)
 
 	type args struct {
 		format  string

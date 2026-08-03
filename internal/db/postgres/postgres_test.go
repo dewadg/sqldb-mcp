@@ -112,6 +112,41 @@ func TestRegclassName(t *testing.T) {
 	}
 }
 
+// --- statement routing sniff -------------------------------------------
+
+func TestIsRowReturning(t *testing.T) {
+	type args struct {
+		sql string
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{name: "select", args: args{sql: "SELECT 1"}, want: true},
+		{name: "with", args: args{sql: "WITH x AS (SELECT 1) SELECT * FROM x"}, want: true},
+		{name: "values", args: args{sql: "VALUES (1), (2)"}, want: true},
+		{name: "table", args: args{sql: "TABLE t"}, want: true},
+		{name: "lowercase leader", args: args{sql: "select 1"}, want: true},
+		{name: "leading whitespace", args: args{sql: "   \n\t SELECT 1"}, want: true},
+		{name: "leading block comment", args: args{sql: "/* hint */ SELECT 1"}, want: true},
+		{name: "leading line comment", args: args{sql: "-- probe\nSELECT 1"}, want: true},
+		{name: "mixed comments and space", args: args{sql: "/* a */ -- b\n  SELECT 1"}, want: true},
+		{name: "insert", args: args{sql: "INSERT INTO t VALUES (1)"}, want: false},
+		{name: "update", args: args{sql: "UPDATE t SET a=1"}, want: false},
+		{name: "delete", args: args{sql: "DELETE FROM t"}, want: false},
+		{name: "create", args: args{sql: "CREATE TABLE t (a int)"}, want: false},
+		{name: "parenthesized expression statement", args: args{sql: "(SELECT 1)"}, want: false},
+		{name: "empty string", args: args{sql: ""}, want: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isRowReturning(tt.args.sql))
+		})
+	}
+}
+
 // --- row cap (task 7.5) -------------------------------------------------
 
 func TestTruncateRows(t *testing.T) {

@@ -1,14 +1,4 @@
-# query-execution
-
-## Purpose
-
-The `execute_query` tool: runs a SQL statement against a selected database,
-returning columns and rows for row-returning statements or the affected row
-count for writes. Enforces read-only by default via a read-only transaction,
-supports unrestricted (read-write) mode by opt-in, and caps results with a row
-limit and per-query timeout.
-
-## Requirements
+## MODIFIED Requirements
 
 ### Requirement: execute_query tool
 

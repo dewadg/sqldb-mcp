@@ -151,10 +151,13 @@ type QuerySpec struct {
 }
 
 // QueryResult is the column metadata plus the (row-limit-capped) rows returned
-// by execute_query.
+// by a row-returning statement, or the affected row count returned by a write.
+// For a SELECT, Columns/Rows are populated and RowsAffected is zero; for a
+// write, RowsAffected is populated and Columns/Rows are empty.
 type QueryResult struct {
-	Columns []string `json:"columns"`
-	Rows    []Row    `json:"rows"`
+	Columns      []string `json:"columns,omitempty"`
+	Rows         []Row    `json:"rows,omitempty"`
+	RowsAffected int64    `json:"rows_affected,omitempty"`
 }
 
 // Row is one result row as an ordered slice of JSON-encodable values.

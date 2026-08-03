@@ -298,10 +298,62 @@ func queryIndexes(ctx context.Context, pool *sql.DB, schema, name string) ([]db.
 	return out, rows.Err()
 }
 
-// ExecQuery runs one query under a transaction whose read-only flag matches
-// spec.Readonly. Postgres rejects any write inside a READ ONLY transaction —
-// including writes inside functions — giving a single strong safety wall. Rows
-// are capped at spec.RowLimit; the transaction is always rolled back.
+// rowReturningLeaders are the SQL statement leaders that produce a row set and
+// therefore run on the query path. Everything else routes to the exec path.
+var rowReturningLeaders = map[string]struct{}{
+	"SELECT": {},
+	"WITH":   {},
+	"VALUES": {},
+	"TABLE":  {},
+}
+
+// isRowReturning reports whether sql begins with a row-returning statement
+// leader. It trims leading whitespace and one run of leading SQL comments
+// (block /* ... */ and line -- ...) before inspecting the first token. It is a
+// routing heuristic only — not a security control.
+func isRowReturning(sql string) bool {
+	s := stripLeadingNoise(sql)
+	// first token = run of non-whitespace
+	end := strings.IndexAny(s, " \t\r\n")
+	if end < 0 {
+		end = len(s)
+	}
+	leader := strings.ToUpper(s[:end])
+	_, ok := rowReturningLeaders[leader]
+	return ok
+}
+
+// stripLeadingNoise removes leading whitespace and leading SQL comments so the
+// first real token is reachable. It handles one consecutive run of /* */ block
+// comments and -- line comments.
+func stripLeadingNoise(s string) string {
+	for {
+		trimmed := strings.TrimLeft(s, " \t\r\n")
+		switch {
+		case strings.HasPrefix(trimmed, "/*"):
+			end := strings.Index(trimmed, "*/")
+			if end < 0 {
+				return "" // unterminated comment; treat as no statement
+			}
+			s = trimmed[end+2:]
+		case strings.HasPrefix(trimmed, "--"):
+			end := strings.IndexAny(trimmed, "\r\n")
+			if end < 0 {
+				return ""
+			}
+			s = trimmed[end:]
+		default:
+			return trimmed
+		}
+	}
+}
+
+// ExecQuery runs one statement under a transaction whose read-only flag matches
+// spec.Readonly. Row-returning statements run via QueryContext, are capped at
+// spec.RowLimit, and roll back (reads never persist). Non-row statements run via
+// ExecContext: under readonly the read-only transaction rejects them; under
+// unrestricted mode they commit on success and report the affected row count,
+// rolling back on error.
 func (Dialect) ExecQuery(ctx context.Context, pool *sql.DB, spec db.QuerySpec) (*db.QueryResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, spec.Timeout)
 	defer cancel()
@@ -310,8 +362,23 @@ func (Dialect) ExecQuery(ctx context.Context, pool *sql.DB, spec db.QuerySpec) (
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = tx.Rollback() }()
 
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if isRowReturning(spec.SQL) {
+		return execRows(ctx, tx, spec)
+	}
+	return execWrite(ctx, tx, spec, &committed)
+}
+
+// execRows runs a row-returning statement, caps rows at spec.RowLimit, and
+// leaves rollback to the caller.
+func execRows(ctx context.Context, tx *sql.Tx, spec db.QuerySpec) (*db.QueryResult, error) {
 	rows, err := tx.QueryContext(ctx, spec.SQL, spec.Args...)
 	if err != nil {
 		return nil, err
@@ -338,7 +405,29 @@ func (Dialect) ExecQuery(ctx context.Context, pool *sql.DB, spec db.QuerySpec) (
 			break
 		}
 	}
-	return result, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// execWrite runs a non-row statement. Under readonly the read-only transaction
+// rejects it before commit. Under unrestricted mode it commits on success and
+// reports the affected row count, rolling back on error. committed is set when
+// the transaction is committed so the deferred rollback is skipped.
+func execWrite(ctx context.Context, tx *sql.Tx, spec db.QuerySpec, committed *bool) (*db.QueryResult, error) {
+	res, err := tx.ExecContext(ctx, spec.SQL, spec.Args...)
+	if err != nil {
+		return nil, err
+	}
+	if !spec.Readonly {
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		*committed = true
+	}
+	affected, _ := res.RowsAffected()
+	return &db.QueryResult{RowsAffected: affected}, nil
 }
 
 // truncateRows caps rows at limit. Pure so the cap can be unit-tested.
