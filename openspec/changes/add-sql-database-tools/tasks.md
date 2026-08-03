@@ -51,7 +51,15 @@
 - [ ] 7.5 `execute_query` row-cap test with a stub returning > `row_limit` rows
 - [ ] 7.6 Tool handler unit tests (fake dialect) for the SQL tools incl. error paths
 - [ ] 7.7 `list_databases` unit test asserting every configured alias is returned with `driver`+`readonly` and that no `url`/credential appears in the output
-- [ ] 7.8 Integration tests guarded by `SQLDB_MCP_TEST_POSTGRES_URL` covering list/details/read/rejected-write/explain (skipped when env unset)
+- [ ] 7.8 Postgres integration tests in `internal/db/postgres`, guarded by `SQLDB_MCP_TEST_POSTGRES_URL` (skip with a clear message when unset)
+  - [ ] 7.8.1 Add a repo-root `.env` loader helper (`testenv_test.go`, no new dependency): parse `KEY=VALUE` / `KEY='VALUE'` lines from `<repo>/.env`, stripping surrounding quotes, and set each key into the process env only when not already set — so `go test ./...` runs without a manual `export`
+  - [ ] 7.8.2 Add a fixture helper: open the DSN via the real postgres dialect, idempotently create a scratch schema+table (e.g. `sqldb_mcp_test.t_item(id INT PK, label TEXT)`), seed a known row count, and `DROP` it in `t.Cleanup`
+  - [ ] 7.8.3 `list_objects`: scratch table appears; `type:"table"` filter returns it; an unsupported `type` returns the dialect's supported-types error
+  - [ ] 7.8.4 `get_object_details`: assert columns (name/type/nullability), the primary-key constraint, and at least one index match the fixture
+  - [ ] 7.8.5 `execute_query` read: `SELECT` returns the seeded rows, truncated at `row_limit`; a bind-param query (`WHERE id = $1`) returns exactly the bound row, value never inlined
+  - [ ] 7.8.6 `execute_query` rejected write: with `readonly: true`, `DELETE`/`INSERT` fails with Postgres' read-only-transaction error and no rows change
+  - [ ] 7.8.7 `explain_query`: text plan non-empty; `format:"json"` output parses as JSON; `analyze:true` runs under the read-only tx and returns a plan (per the query-explanation spec)
+  - [ ] 7.8.8 Run via `go test ./internal/db/postgres/...`; the env var may be overridden inline to point tests at another Postgres
 
 ## 8. Documentation
 
