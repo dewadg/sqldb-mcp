@@ -1,0 +1,27 @@
+# sqldb-mcp database configuration.
+#
+# Every setting lives on its database entry; there is no shared defaults block.
+# Omitted optional fields fall back to hardcoded constants:
+#   readonly: true, query_timeout: 30s, row_limit: 100,
+#   max_open_conns: 10, max_idle_conns: 5, conn_max_idle_time: 5m
+#
+# Place this file at ./sqldb-mcp.yaml for auto-load, or point at it with
+# --config / SQLDB_MCP_CONFIG.
+
+databases:
+  primary:
+    driver: postgres
+    url: postgresql://user:pass@localhost:5432/appdb?sslmode=disable
+    readonly: true          # default; execute_query refuses writes
+    query_timeout: 30s
+    row_limit: 100
+    max_open_conns: 10
+    max_idle_conns: 5
+    conn_max_idle_time: 5m
+
+  # A second database served from the same server. Set readonly: false to allow
+  # writes from execute_query by explicit opt-in.
+  # warehouse:
+  #   driver: postgres
+  #   url: postgresql://user:pass@localhost:5432/warehouse?sslmode=disable
+  #   readonly: false
