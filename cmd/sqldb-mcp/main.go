@@ -27,6 +27,7 @@ import (
 
 func main() {
 	httpAddr := flag.String("http", "", "address to serve the streamable-HTTP transport on (e.g. :8080); when empty, serve stdio")
+	configPath := flag.String("config", "", "path to the database YAML config file (overrides SQLDB_MCP_CONFIG and auto-loaded sqldb-mcp.yaml)")
 	flag.Parse()
 
 	cfg, err := config.Load()
@@ -35,6 +36,19 @@ func main() {
 		os.Exit(1)
 	}
 	logger := newLogger(cfg.LogLevel)
+
+	// Resolve and load the database registry config. With no config source the
+	// server still starts with an empty registry; ping and list_databases keep
+	// working and the other SQL tools return a clear "no databases" error.
+	resolvedPath, found := config.ResolveDatabaseConfigPath(*configPath)
+	dbCfg, err := config.LoadDatabaseConfig(resolvedPath)
+	if err != nil {
+		logger.Error("invalid database config", "path", resolvedPath, "error", err)
+		os.Exit(1)
+	}
+	if found {
+		logger.Info("loaded database config", "path", resolvedPath, "databases", len(dbCfg.Databases))
+	}
 
 	// The transport is chosen by the --http flag alone: when it is set we serve
 	// streamable HTTP at the given address; when absent we serve stdio. The
@@ -51,7 +65,16 @@ func main() {
 		cfg.HTTPAddr = addr
 	}
 
-	srv := server.New(&cfg, logger)
+	srv, reg, err := server.New(&cfg, &dbCfg, logger)
+	if err != nil {
+		logger.Error("failed to build server", "error", err)
+		os.Exit(1)
+	}
+	defer func() {
+		if cErr := reg.Close(); cErr != nil {
+			logger.Error("database registry close failed", "error", cErr)
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

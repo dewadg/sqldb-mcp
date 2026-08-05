@@ -1,12 +1,16 @@
-// Package config loads runtime configuration from environment variables.
+// Package config loads runtime configuration.
 //
-// All settings have sensible defaults so the server runs out of the box in
-// stdio mode; override individual values via the environment for deployments.
+// Server identity/transport/log level are read from environment variables (kept
+// unchanged from the scaffold) so nothing already documented breaks. The
+// database registry is loaded from a YAML config file whose path is resolved
+// from a --config flag, the SQLDB_MCP_CONFIG env var, or an auto-loaded
+// ./sqldb-mcp.yaml.
 package config
 
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -57,4 +61,26 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// ResolveDatabaseConfigPath resolves the database config file path in this
+// order: the explicit --config value, then the SQLDB_MCP_CONFIG env var, then
+// an auto-loaded ./sqldb-mcp.yaml if it exists. It returns the path and whether
+// one was found; an empty path with found=false means "run with no databases".
+func ResolveDatabaseConfigPath(explicit string) (string, bool) {
+	if v := strings.TrimSpace(explicit); v != "" {
+		return v, true
+	}
+	if v, ok := os.LookupEnv("SQLDB_MCP_CONFIG"); ok && strings.TrimSpace(v) != "" {
+		return v, true
+	}
+	const auto = "sqldb-mcp.yaml"
+	if info, err := os.Stat(auto); err == nil && !info.IsDir() {
+		abs, err := filepath.Abs(auto)
+		if err != nil {
+			return auto, true
+		}
+		return abs, true
+	}
+	return "", false
 }

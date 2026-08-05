@@ -105,6 +105,13 @@ Expose `list_databases` (no arguments) returning one entry per configured databa
 
 - *Why a tool over Instructions-only:* an LLM can call it reliably and receive structured data; prose `Instructions` are advisory and easy to ignore or hallucinate past. The server still lists aliases in `Instructions` as a hint, but `list_databases` is the source of truth.
 
+### D8. Integration tests load repo-root `.env`; `.env` is test-only
+
+Postgres integration tests consume `SQLDB_MCP_TEST_POSTGRES_URL`. A tiny `testenv` helper reads `<repo>/.env` (`KEY=VALUE` / `KEY='VALUE'`, quotes stripped) and populates the process env for keys not already set, so `go test ./internal/db/postgres/...` runs with no manual `export` while an explicit env var or CI secret still takes precedence. `.env` is `.gitignore`d and never read by the server at runtime — runtime config is the YAML file (D5); the loader exists only under `*_test.go`.
+
+- *Why over `godotenv`:* one ~15-line parser avoids a new dependency for a test-only need.
+- *Why skip-on-unset over a build tag:* keeps `go test ./...` as the single command; absence is reported explicitly instead of silently not compiling.
+
 ## Flow
 
 ```mermaid
@@ -164,7 +171,7 @@ Unit tests (table-driven, `internal/tools` + `internal/db`):
 - **Object/Details/Explain SQL builders**: golden-string tests over generated SQL for given schema/name/format inputs.
 - **execute_query row cap**: stub returning 250 rows is truncated to `row_limit`.
 
-Integration (guarded by `SQLDB_MCP_TEST_POSTGRES_URL`, skipped otherwise): spin queries against a real Postgres for `list_objects`, `get_object_details`, `execute_query` (read + rejected write), and `explain_query` (text + analyze).
+Integration tests live in `internal/db/postgres` and are guarded by the `SQLDB_MCP_TEST_POSTGRES_URL` connection string — a libpq keyword/value DSN (e.g. `host=... user=... password=... dbname=sqldb_mcp_test sslmode=disable`) that the `pgx` stdlib driver accepts directly. A small `testenv` test helper loads the repo-root `.env` into the process env (only for keys not already set, so an explicit `export` or CI var still wins) so plain `go test` works; if the URL is still absent the suite `t.Skip`s with a clear message. Each test connects via the real postgres dialect, builds an idempotent scratch fixture (`sqldb_mcp_test.t_item`) dropped in `t.Cleanup`, then covers `list_objects` (presence + type filter + unsupported-type error), `get_object_details` (columns/constraint/index), `execute_query` (read with row cap, bind params, write rejected by the read-only transaction), and `explain_query` (text + JSON + `analyze` under the read-only tx).
 
 ## Migration Plan
 
