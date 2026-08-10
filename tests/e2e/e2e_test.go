@@ -251,10 +251,10 @@ func TestE2E_ListObjects(t *testing.T) {
 		typ string
 	}
 	tests := []struct {
-		name         string
-		args         args
-		wantName     string
-		wantIsError  bool
+		name        string
+		args        args
+		wantName    string
+		wantIsError bool
 	}{
 		{name: "scratch table present", args: args{typ: "table"}, wantName: "t_item"},
 		{name: "unsupported type errors", args: args{typ: "materialized_view"}, wantIsError: true},
@@ -462,4 +462,98 @@ func TestE2E_ExplainQuery(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- startup tolerance --------------------------------------------------
+
+// TestE2E_StartupTolerance exercises the connect-failure tolerance path: with
+// every configured DB pointing at an unreachable port, server.New must still
+// succeed, ping/list_databases must still work, list_databases must report each
+// alias as unavailable, and SQL tools must surface a per-DB "unavailable" error.
+// It needs no live Postgres because the postgres dialect fails fast on a
+// refused TCP port (ECONNREFUSED), so it skips the SQLDB_MCP_TEST_POSTGRES_URL
+// guard.
+func TestE2E_StartupTolerance(t *testing.T) {
+	loadDotEnv(t) // keep parity with the rest of the suite; not required here
+
+	// 127.0.0.1:1 is never listened on; the kernel refuses immediately, so the
+	// pgx ping fails fast without waiting on a timeout. connect_timeout caps any
+	// pathological host-unreachable case on a CI host that drops the loopback
+	// RST.
+	const refusedURL = "postgresql://nobody:nopass@127.0.0.1:1/nodb?sslmode=disable&connect_timeout=2"
+
+	limit := db.DefaultRowLimit
+	dbCfg := db.Config{Databases: map[string]db.DatabaseConfig{
+		"primary":   {Driver: "postgres", URL: refusedURL, RowLimit: &limit},
+		"secondary": {Driver: "postgres", URL: refusedURL, RowLimit: &limit},
+	}}
+	dbCfg.ApplyDefaults()
+
+	srvCfg := &config.Config{ServerName: "sqldb-mcp-e2e", ServerVersion: "test", LogLevel: "info"}
+	srv, reg, err := server.New(srvCfg, &dbCfg, nil)
+	assert.NoError(t, err, "server.New must tolerate connect failures")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	clientT, serverT := mcp.NewInMemoryTransports()
+
+	runErr := make(chan error, 1)
+	go func() { runErr <- srv.Run(ctx, serverT) }()
+
+	cl := mcp.NewClient(&mcp.Implementation{Name: "e2e-client", Version: "test"}, nil)
+	session, err := cl.Connect(ctx, clientT, nil)
+	assert.NoError(t, err)
+	defer func() { _ = session.Close() }()
+
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-runErr:
+		case <-time.After(5 * time.Second):
+			t.Error("server.Run did not exit within 5s")
+		}
+		assert.NoError(t, reg.Close())
+	})
+
+	t.Run("list_databases reports every configured alias as unavailable", func(t *testing.T) {
+		var out tools.ListDatabasesOutput
+		decode(t, callText(t, session, "list_databases", map[string]any{}), &out)
+		if assert.Len(t, out.Databases, 2) {
+			byAlias := map[string]db.DatabaseInfo{}
+			for _, d := range out.Databases {
+				byAlias[d.Alias] = d
+			}
+			for _, alias := range []string{"primary", "secondary"} {
+				d, ok := byAlias[alias]
+				if !assert.True(t, ok, "missing alias %q", alias) {
+					continue
+				}
+				assert.Equal(t, "postgres", d.Driver)
+				assert.Equal(t, db.StatusUnavailable, d.Status, "alias %q should be unavailable", alias)
+			}
+		}
+	})
+
+	t.Run("ping still works when every DB is down", func(t *testing.T) {
+		var out tools.PingOutput
+		decode(t, callText(t, session, "ping", map[string]any{}), &out)
+		assert.Equal(t, "sqldb-mcp-e2e", out.Server)
+	})
+
+	t.Run("execute_query against a down alias returns unavailable", func(t *testing.T) {
+		res := callResult(t, session, "execute_query", map[string]any{
+			"database": "primary",
+			"query":    "SELECT 1",
+		})
+		assert.True(t, res.IsError, "expected an error result for the down alias")
+		assert.Contains(t, contentText(res), "unavailable")
+	})
+
+	t.Run("list_objects against a down alias returns unavailable", func(t *testing.T) {
+		res := callResult(t, session, "list_objects", map[string]any{
+			"database": "secondary",
+		})
+		assert.True(t, res.IsError, "expected an error result for the down alias")
+		assert.Contains(t, contentText(res), "unavailable")
+	})
 }
