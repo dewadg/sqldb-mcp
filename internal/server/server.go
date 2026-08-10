@@ -34,6 +34,17 @@ func New(cfg *config.Config, dbCfg *db.Config, logger *slog.Logger) (*mcp.Server
 	if err != nil {
 		return nil, nil, err
 	}
+	// Surface per-DB connect failures at startup without killing the server.
+	// The registry stays logger-free (Open owns pool lifecycle, not logging);
+	// server.New is the composition root that owns both the logger and the
+	// registry, so the warn belongs here. The URL is redacted before logging.
+	for alias, u := range reg.Unavailable() {
+		logger.Warn("database unavailable at startup",
+			"alias", alias,
+			"url", db.RedactURL(u.Config.URL),
+			"error", u.Err,
+		)
+	}
 
 	srv := mcp.NewServer(
 		&mcp.Implementation{Name: cfg.ServerName, Version: cfg.ServerVersion},

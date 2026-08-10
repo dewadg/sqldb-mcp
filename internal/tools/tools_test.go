@@ -19,7 +19,7 @@ import (
 type tConnector struct{}
 
 func (tConnector) Connect(context.Context) (driver.Conn, error) { return tConn{}, nil }
-func (tConnector) Driver() driver.Driver                       { return tDriver{} }
+func (tConnector) Driver() driver.Driver                        { return tDriver{} }
 
 type tDriver struct{}
 
@@ -28,8 +28,8 @@ func (tDriver) Open(string) (driver.Conn, error) { return tConn{}, nil }
 type tConn struct{}
 
 func (tConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("noop") }
-func (tConn) Close() error                         { return nil }
-func (tConn) Begin() (driver.Tx, error)            { return nil, errors.New("noop") }
+func (tConn) Close() error                        { return nil }
+func (tConn) Begin() (driver.Tx, error)           { return nil, errors.New("noop") }
 
 func tPool() *sql.DB { return sql.OpenDB(tConnector{}) }
 
@@ -116,7 +116,7 @@ func TestListDatabasesHandler(t *testing.T) {
 		want []db.DatabaseInfo
 	}{
 		{name: "nil registry returns empty list", reg: nil, want: []db.DatabaseInfo{}},
-		{name: "returns alias driver readonly, no url", reg: singleReadOnlyRegistry(t), want: []db.DatabaseInfo{{Alias: "primary", Driver: "fake", Readonly: true}}},
+		{name: "returns alias driver readonly status, no url", reg: singleReadOnlyRegistry(t), want: []db.DatabaseInfo{{Alias: "primary", Driver: "fake", Readonly: true, Status: db.StatusAvailable}}},
 	}
 
 	for _, tt := range tests {
@@ -151,7 +151,7 @@ func TestListObjectsHandler(t *testing.T) {
 	}{
 		{
 			name:    "dispatches to dialect",
-			reg: regWith(t, &tDialect{name: "fake", listResult: []db.Object{{Name: "t", Type: "table"}}}),
+			reg:     regWith(t, &tDialect{name: "fake", listResult: []db.Object{{Name: "t", Type: "table"}}}),
 			args:    args{in: ListObjectsInput{Database: "primary"}},
 			want:    []db.Object{{Name: "t", Type: "table"}},
 			wantErr: assert.NoError,
@@ -241,8 +241,11 @@ func TestExecuteQueryHandler(t *testing.T) {
 		wantErr      assert.ErrorAssertionFunc
 	}{
 		{
-			name:         "readonly true by default propagated to dialect",
-			setup:        func(t *testing.T) (*db.Registry, *tDialect) { fd := &tDialect{name: "fake", queryResult: result}; return openRegistry(t, fd, nil), fd },
+			name: "readonly true by default propagated to dialect",
+			setup: func(t *testing.T) (*db.Registry, *tDialect) {
+				fd := &tDialect{name: "fake", queryResult: result}
+				return openRegistry(t, fd, nil), fd
+			},
 			args:         args{in: ExecuteQueryInput{Database: "primary", Query: "SELECT 1"}},
 			wantResult:   result,
 			wantReadonly: true,
@@ -250,8 +253,12 @@ func TestExecuteQueryHandler(t *testing.T) {
 			wantErr:      assert.NoError,
 		},
 		{
-			name:         "readonly false propagated when configured",
-			setup:        func(t *testing.T) (*db.Registry, *tDialect) { fa := false; fd := &tDialect{name: "fake", queryResult: result}; return openRegistry(t, fd, &fa), fd },
+			name: "readonly false propagated when configured",
+			setup: func(t *testing.T) (*db.Registry, *tDialect) {
+				fa := false
+				fd := &tDialect{name: "fake", queryResult: result}
+				return openRegistry(t, fd, &fa), fd
+			},
 			args:         args{in: ExecuteQueryInput{Database: "primary", Query: "SELECT 1"}},
 			wantResult:   result,
 			wantReadonly: false,
@@ -259,8 +266,11 @@ func TestExecuteQueryHandler(t *testing.T) {
 			wantErr:      assert.NoError,
 		},
 		{
-			name:    "empty query errors",
-			setup:   func(t *testing.T) (*db.Registry, *tDialect) { fd := &tDialect{name: "fake"}; return openRegistry(t, fd, nil), fd },
+			name: "empty query errors",
+			setup: func(t *testing.T) (*db.Registry, *tDialect) {
+				fd := &tDialect{name: "fake"}
+				return openRegistry(t, fd, nil), fd
+			},
 			args:    args{in: ExecuteQueryInput{Database: "primary", Query: "  "}},
 			wantErr: assert.Error,
 		},
@@ -300,7 +310,6 @@ func openRegistry(t *testing.T, fd *tDialect, readonly *bool) *db.Registry {
 	t.Cleanup(func() { _ = reg.Close() })
 	return reg
 }
-
 
 // --- explain_query (task 7.6) -------------------------------------------
 

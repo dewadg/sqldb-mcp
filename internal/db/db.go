@@ -205,19 +205,33 @@ type Dialect interface {
 	Explain(ctx context.Context, db *sql.DB, spec ExplainSpec) (*ExplainResult, error)
 }
 
+// Status values reported by DatabaseInfo.
+const (
+	StatusAvailable   = "available"
+	StatusUnavailable = "unavailable"
+)
+
 // DatabaseInfo is the public, credential-free view of one configured database,
 // returned by list_databases. The connection URL is deliberately omitted.
+// Status is "available" when the pool opened and pinged at startup, or
+// "unavailable" when the connect failed (the alias is still listed so callers
+// can tell a down DB apart from an unknown one).
 type DatabaseInfo struct {
 	Alias    string `json:"alias"`
 	Driver   string `json:"driver"`
 	Readonly bool   `json:"readonly"`
+	Status   string `json:"status"`
 }
 
-// entry is one open database held by the Registry.
+// entry is one database held by the Registry. When the connect at startup
+// failed, pool is nil and connectErr carries the reason; the entry stays in the
+// map so list_databases still shows it and Resolve can surface a clear
+// "database unavailable" error instead of "unknown alias".
 type entry struct {
-	cfg     DatabaseConfig
-	pool    *sql.DB
-	dialect Dialect
+	cfg        DatabaseConfig
+	pool       *sql.DB
+	dialect    Dialect
+	connectErr error
 }
 
 // Registry resolves database aliases to their open pool and dialect. It owns
@@ -246,10 +260,18 @@ func NewRegistry(dialects ...Dialect) (*Registry, error) {
 }
 
 // Open validates cfg, opens and pings a pool for every configured database, and
-// stores the result. It returns an error naming the offending alias on any
-// validation or connection failure, leaving already-opened pools closed.
+// stores the result. Structural config errors (unknown driver, missing driver or
+// url) are fatal and returned as a non-nil error, aborting startup.
+//
+// Per-database connect failures are NOT fatal: the failed alias is recorded with
+// a nil pool and its connect error, and the rest are still opened. The entry is
+// kept in the map so list_databases reports it as unavailable and Resolve
+// surfaces a clear "database unavailable" error rather than "unknown alias".
+// Callers wanting startup to be all-or-nothing should validate configs before
+// calling Open; this method's contract is "open what can be opened, keep going".
 func (r *Registry) Open(ctx context.Context, cfg Config) error {
-	// Structural validation first, before opening anything.
+	// Structural validation first, before opening anything. These are config
+	// bugs and stay fatal — tolerance is for transient connect failures.
 	for alias, e := range cfg.Databases {
 		if strings.TrimSpace(e.Driver) == "" {
 			return fmt.Errorf("database %q: driver is required", alias)
@@ -262,16 +284,16 @@ func (r *Registry) Open(ctx context.Context, cfg Config) error {
 		}
 	}
 
-	// Open + ping. On any failure close what we already opened.
+	// Open + ping. A connect failure is stored on the entry and the loop
+	// continues; already-opened pools are NOT torn down so the reachable DBs
+	// keep serving.
 	opened := make(map[string]*entry, len(cfg.Databases))
 	for alias, e := range cfg.Databases {
 		dialect := r.dialects[e.Driver]
 		pool, err := dialect.OpenDB(ctx, e)
 		if err != nil {
-			for _, en := range opened {
-				_ = en.pool.Close()
-			}
-			return fmt.Errorf("database %q: connect failed: %w", alias, err)
+			opened[alias] = &entry{cfg: e, pool: nil, dialect: dialect, connectErr: err}
+			continue
 		}
 		opened[alias] = &entry{cfg: e, pool: pool, dialect: dialect}
 	}
@@ -291,13 +313,19 @@ func (r *Registry) registeredDrivers() string {
 // Resolve maps an alias to its pool, dialect, and config. An empty alias
 // resolves to the sole configured database; with more than one database it is
 // ambiguous and returns an error. An unknown alias returns an error listing the
-// configured aliases.
+// configured aliases. A matched alias whose connect failed at startup returns a
+// wrapped "database unavailable" error carrying the original reason — the
+// empty-alias/sole-DB path hits the same check so a nil pool is never handed
+// back to the caller.
 func (r *Registry) Resolve(alias string) (*sql.DB, Dialect, DatabaseConfig, error) {
 	alias = strings.TrimSpace(alias)
 	if alias != "" {
 		en, ok := r.entries[alias]
 		if !ok {
 			return nil, nil, DatabaseConfig{}, fmt.Errorf("unknown database alias %q (configured: %s)", alias, r.configuredAliases())
+		}
+		if en.connectErr != nil {
+			return nil, nil, DatabaseConfig{}, fmt.Errorf("database %q unavailable: %w", alias, en.connectErr)
 		}
 		return en.pool, en.dialect, en.cfg, nil
 	}
@@ -306,7 +334,10 @@ func (r *Registry) Resolve(alias string) (*sql.DB, Dialect, DatabaseConfig, erro
 	case 0:
 		return nil, nil, DatabaseConfig{}, errors.New("no databases configured")
 	case 1:
-		for _, en := range r.entries {
+		for alias, en := range r.entries {
+			if en.connectErr != nil {
+				return nil, nil, DatabaseConfig{}, fmt.Errorf("database %q unavailable: %w", alias, en.connectErr)
+			}
 			return en.pool, en.dialect, en.cfg, nil
 		}
 	default:
@@ -324,7 +355,9 @@ func (r *Registry) configuredAliases() string {
 	return strings.Join(aliases, ", ")
 }
 
-// ListDatabases returns the credential-free view of every configured database.
+// ListDatabases returns the credential-free view of every configured database,
+// including those that failed to connect: their Status reports "unavailable" so
+// callers can tell a down DB from an unknown alias without probing.
 func (r *Registry) ListDatabases() []DatabaseInfo {
 	out := make([]DatabaseInfo, 0, len(r.entries))
 	for alias, en := range r.entries {
@@ -332,16 +365,48 @@ func (r *Registry) ListDatabases() []DatabaseInfo {
 		if en.cfg.Readonly != nil {
 			readonly = *en.cfg.Readonly
 		}
-		out = append(out, DatabaseInfo{Alias: alias, Driver: en.cfg.Driver, Readonly: readonly})
+		status := StatusAvailable
+		if en.connectErr != nil {
+			status = StatusUnavailable
+		}
+		out = append(out, DatabaseInfo{Alias: alias, Driver: en.cfg.Driver, Readonly: readonly, Status: status})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Alias < out[j].Alias })
 	return out
 }
 
-// Close closes every open pool. Errors from individual closes are joined.
+// UnavailableDB describes one database whose connect failed at startup. Config
+// is included so callers (only the composition root, for logging) can redact
+// and print the URL; Err is the dialect-level failure. Err is never nil inside
+// the map.
+type UnavailableDB struct {
+	Config DatabaseConfig
+	Err    error
+}
+
+// Unavailable returns one entry per database that failed to connect at startup,
+// keyed by alias. It is the single source of truth for the startup log line:
+// server.New iterates this map and warns with db.RedactURL(Config.URL) plus Err.
+// Returns an empty (non-nil) map when every configured DB connected.
+func (r *Registry) Unavailable() map[string]UnavailableDB {
+	out := make(map[string]UnavailableDB)
+	for alias, en := range r.entries {
+		if en.connectErr != nil {
+			out[alias] = UnavailableDB{Config: en.cfg, Err: en.connectErr}
+		}
+	}
+	return out
+}
+
+// Close closes every open pool. Entries whose connect failed (nil pool) are
+// skipped so Close stays safe alongside tolerance. Errors from individual
+// closes are joined.
 func (r *Registry) Close() error {
 	var errs []error
 	for _, en := range r.entries {
+		if en.pool == nil {
+			continue
+		}
 		if err := en.pool.Close(); err != nil {
 			errs = append(errs, err)
 		}

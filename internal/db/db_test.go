@@ -21,7 +21,7 @@ import (
 type noopConnector struct{}
 
 func (noopConnector) Connect(context.Context) (driver.Conn, error) { return noopConn{}, nil }
-func (noopConnector) Driver() driver.Driver                       { return noopDriver{} }
+func (noopConnector) Driver() driver.Driver                        { return noopDriver{} }
 
 type noopDriver struct{}
 
@@ -30,8 +30,8 @@ func (noopDriver) Open(string) (driver.Conn, error) { return noopConn{}, nil }
 type noopConn struct{}
 
 func (noopConn) Prepare(string) (driver.Stmt, error) { return nil, errors.New("noop conn") }
-func (noopConn) Close() error                         { return nil }
-func (noopConn) Begin() (driver.Tx, error)            { return nil, errors.New("noop conn") }
+func (noopConn) Close() error                        { return nil }
+func (noopConn) Begin() (driver.Tx, error)           { return nil, errors.New("noop conn") }
 
 func fakePool() *sql.DB { return sql.OpenDB(noopConnector{}) }
 
@@ -39,9 +39,10 @@ func fakePool() *sql.DB { return sql.OpenDB(noopConnector{}) }
 // tool-handler tests. Each method records its input and returns the configured
 // result/error, so tests assert on dispatch and policy without a database.
 type fakeDialect struct {
-	name     string
-	openErr  error
-	lastSpec QuerySpec
+	name         string
+	openErr      error
+	openErrByURL map[string]error // per-URL open behavior; wins over openErr when the URL matches
+	lastSpec     QuerySpec
 
 	listResult    []Object
 	listErr       error
@@ -54,7 +55,10 @@ type fakeDialect struct {
 }
 
 func (f *fakeDialect) Name() string { return f.name }
-func (f *fakeDialect) OpenDB(_ context.Context, _ DatabaseConfig) (*sql.DB, error) {
+func (f *fakeDialect) OpenDB(_ context.Context, cfg DatabaseConfig) (*sql.DB, error) {
+	if err, ok := f.openErrByURL[cfg.URL]; ok {
+		return nil, err
+	}
 	if f.openErr != nil {
 		return nil, f.openErr
 	}
@@ -140,53 +144,103 @@ func TestDatabaseConfig_ApplyDefaults(t *testing.T) {
 
 func ptrInt(v int) *int { return &v }
 
-// --- Registry.Open validation (task 7.1/7.2) ---------------------------
+// --- Registry.Open validation + connect tolerance ----------------------
 
 func TestRegistry_Open(t *testing.T) {
 	type args struct {
 		ctx context.Context
 		cfg Config
 	}
+	// fields wires a fresh fake dialect per row so cases can configure
+	// per-URL open behavior without cross-row state leakage.
+	type fields struct {
+		dialect *fakeDialect
+	}
 	tests := []struct {
-		name    string
-		args    args
-		wantErr assert.ErrorAssertionFunc
+		name            string
+		fields          fields
+		args            args
+		wantErr         assert.ErrorAssertionFunc
+		wantErrContains string
+		// postOpen runs additional state assertions on the registry after a
+		// successful Open. It is nil for the fatal-validation rows; the loop
+		// body nil-checks it before calling.
+		postOpen func(t *testing.T, reg *Registry)
 	}{
 		{
-			name:    "unknown driver rejected",
+			name:            "empty driver is fatal",
+			fields:          fields{dialect: &fakeDialect{name: "fake"}},
+			args:            args{ctx: context.Background(), cfg: Config{Databases: map[string]DatabaseConfig{"x": {Driver: "", URL: "u"}}}},
+			wantErr:         assert.Error,
+			wantErrContains: "driver is required",
+		},
+		{
+			name:    "unknown driver is fatal",
+			fields:  fields{dialect: &fakeDialect{name: "fake"}},
 			args:    args{ctx: context.Background(), cfg: Config{Databases: map[string]DatabaseConfig{"x": {Driver: "mysql", URL: "u"}}}},
 			wantErr: assert.Error,
 		},
 		{
-			name:    "missing url rejected",
+			name:    "missing url is fatal",
+			fields:  fields{dialect: &fakeDialect{name: "fake"}},
 			args:    args{ctx: context.Background(), cfg: Config{Databases: map[string]DatabaseConfig{"x": {Driver: "fake"}}}},
 			wantErr: assert.Error,
 		},
 		{
-			name:    "open error surfaces",
-			args:    args{ctx: context.Background(), cfg: Config{Databases: map[string]DatabaseConfig{"x": {Driver: "fake", URL: "u"}}}},
-			wantErr: assert.Error,
+			name:   "one of two aliases failing connect is tolerated",
+			fields: fields{dialect: &fakeDialect{name: "fake", openErrByURL: map[string]error{"fail": errors.New("boom")}}},
+			args: args{ctx: context.Background(), cfg: Config{Databases: map[string]DatabaseConfig{
+				"ok":   {Driver: "fake", URL: "ok"},
+				"down": {Driver: "fake", URL: "fail"},
+			}}},
+			wantErr: assert.NoError,
+			postOpen: func(t *testing.T, reg *Registry) {
+				assert.Len(t, reg.Unavailable(), 1, "expected exactly one unavailable entry")
+				_, _, _, err := reg.Resolve("down")
+				if assert.Error(t, err) {
+					assert.Contains(t, err.Error(), "unavailable")
+				}
+			},
+		},
+		{
+			name:    "every DB failing connect is tolerated",
+			fields:  fields{dialect: &fakeDialect{name: "fake", openErr: errors.New("net is down")}},
+			args:    args{ctx: context.Background(), cfg: Config{Databases: map[string]DatabaseConfig{"a": {Driver: "fake", URL: "u1"}, "b": {Driver: "fake", URL: "u2"}}}},
+			wantErr: assert.NoError,
+			postOpen: func(t *testing.T, reg *Registry) {
+				assert.Len(t, reg.Unavailable(), 2, "expected every configured DB to be unavailable")
+			},
 		},
 		{
 			name:    "valid config opens pools",
+			fields:  fields{dialect: &fakeDialect{name: "fake"}},
 			args:    args{ctx: context.Background(), cfg: Config{Databases: map[string]DatabaseConfig{"x": {Driver: "fake", URL: "u"}}}},
 			wantErr: assert.NoError,
+			postOpen: func(t *testing.T, reg *Registry) {
+				assert.Empty(t, reg.Unavailable(), "no entries should be unavailable for a valid config")
+			},
 		},
 	}
 
-	fdErr := &fakeDialect{name: "fake", openErr: errors.New("boom")}
-	fdOK := &fakeDialect{name: "fake"}
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			fd := fdOK
-			if tt.name == "open error surfaces" {
-				fd = fdErr
-			}
-			reg, err := NewRegistry(fd)
+			reg, err := NewRegistry(tt.fields.dialect)
 			assert.NoError(t, err)
 			err = reg.Open(tt.args.ctx, tt.args.cfg)
-			tt.wantErr(t, err, fmt.Sprintf("Open(%v)", tt.args.cfg))
+			if !tt.wantErr(t, err, fmt.Sprintf("Open(%v)", tt.args.cfg)) {
+				_ = reg.Close()
+				return
+			}
+			if err != nil {
+				if tt.wantErrContains != "" {
+					assert.Contains(t, err.Error(), tt.wantErrContains)
+				}
+				_ = reg.Close()
+				return
+			}
+			if tt.postOpen != nil {
+				tt.postOpen(t, reg)
+			}
 			_ = reg.Close()
 		})
 	}
@@ -205,12 +259,13 @@ func TestRegistry_Resolve(t *testing.T) {
 		alias string
 	}
 	tests := []struct {
-		name        string
-		fields      fields
-		args        args
-		wantDialect string
-		wantURL     string
-		wantErr     assert.ErrorAssertionFunc
+		name            string
+		fields          fields
+		args            args
+		wantDialect     string
+		wantURL         string
+		wantErr         assert.ErrorAssertionFunc
+		wantErrContains string
 	}{
 		{
 			name:        "explicit alias resolves",
@@ -246,6 +301,31 @@ func TestRegistry_Resolve(t *testing.T) {
 			args:    args{alias: ""},
 			wantErr: assert.Error,
 		},
+		{
+			name: "unavailable alias by name surfaces connect err",
+			fields: fields{
+				dialects: map[string]Dialect{"fake": fd},
+				entries: map[string]*entry{
+					"primary": {cfg: DatabaseConfig{URL: "u1", Driver: "fake"}, pool: fakePool(), dialect: fd},
+					"down":    {cfg: DatabaseConfig{URL: "u2", Driver: "fake"}, pool: nil, dialect: fd, connectErr: errors.New("refused")},
+				},
+			},
+			args:            args{alias: "down"},
+			wantErr:         assert.Error,
+			wantErrContains: `database "down" unavailable`,
+		},
+		{
+			name: "sole DB unavailable surfaces connect err via empty alias",
+			fields: fields{
+				dialects: map[string]Dialect{"fake": fd},
+				entries: map[string]*entry{
+					"only": {cfg: DatabaseConfig{URL: "u1", Driver: "fake"}, pool: nil, dialect: fd, connectErr: errors.New("refused")},
+				},
+			},
+			args:            args{alias: ""},
+			wantErr:         assert.Error,
+			wantErrContains: `database "only" unavailable`,
+		},
 	}
 
 	for _, tt := range tests {
@@ -256,6 +336,9 @@ func TestRegistry_Resolve(t *testing.T) {
 				return
 			}
 			if err != nil {
+				if tt.wantErrContains != "" {
+					assert.Contains(t, err.Error(), tt.wantErrContains)
+				}
 				return
 			}
 			assert.NotNil(t, pool)
@@ -312,7 +395,7 @@ func TestRegistry_ListDatabases(t *testing.T) {
 		want []DatabaseInfo
 	}{
 		{
-			name: "lists aliases with driver and readonly, sorted, no url",
+			name: "lists aliases with driver, readonly, status, sorted, no url",
 			fields: struct {
 				dialects map[string]Dialect
 				entries  map[string]*entry
@@ -324,8 +407,25 @@ func TestRegistry_ListDatabases(t *testing.T) {
 				},
 			},
 			want: []DatabaseInfo{
-				{Alias: "primary", Driver: "postgres", Readonly: true},
-				{Alias: "warehouse", Driver: "postgres", Readonly: false},
+				{Alias: "primary", Driver: "postgres", Readonly: true, Status: StatusAvailable},
+				{Alias: "warehouse", Driver: "postgres", Readonly: false, Status: StatusAvailable},
+			},
+		},
+		{
+			name: "failed entry reports unavailable status",
+			fields: struct {
+				dialects map[string]Dialect
+				entries  map[string]*entry
+			}{
+				dialects: map[string]Dialect{"fake": fd},
+				entries: map[string]*entry{
+					"primary": {cfg: DatabaseConfig{URL: "secret://u1", Driver: "postgres", Readonly: &tr}, pool: fakePool(), dialect: fd},
+					"down":    {cfg: DatabaseConfig{URL: "secret://u2", Driver: "postgres", Readonly: &tr}, pool: nil, dialect: fd, connectErr: errors.New("refused")},
+				},
+			},
+			want: []DatabaseInfo{
+				{Alias: "down", Driver: "postgres", Readonly: true, Status: StatusUnavailable},
+				{Alias: "primary", Driver: "postgres", Readonly: true, Status: StatusAvailable},
 			},
 		},
 		{
@@ -346,6 +446,123 @@ func TestRegistry_ListDatabases(t *testing.T) {
 			r := &Registry{dialects: tt.fields.dialects, entries: tt.fields.entries}
 			got := r.ListDatabases()
 			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// --- Registry.Unavailable -----------------------------------------------
+
+func TestRegistry_Unavailable(t *testing.T) {
+	fd := &fakeDialect{name: "fake"}
+	connectErr := errors.New("refused")
+
+	type fields struct {
+		dialects map[string]Dialect
+		entries  map[string]*entry
+	}
+	tests := []struct {
+		name   string
+		fields fields
+		want   map[string]UnavailableDB
+	}{
+		{
+			name: "empty when every DB connected",
+			fields: fields{
+				dialects: map[string]Dialect{"fake": fd},
+				entries: map[string]*entry{
+					"a": {cfg: DatabaseConfig{URL: "u1", Driver: "fake"}, pool: fakePool(), dialect: fd},
+				},
+			},
+			want: map[string]UnavailableDB{},
+		},
+		{
+			name: "returns alias -> {config, err} for the failed entry only",
+			fields: fields{
+				dialects: map[string]Dialect{"fake": fd},
+				entries: map[string]*entry{
+					"a":    {cfg: DatabaseConfig{URL: "u1", Driver: "fake"}, pool: fakePool(), dialect: fd},
+					"down": {cfg: DatabaseConfig{URL: "u2", Driver: "fake"}, pool: nil, dialect: fd, connectErr: connectErr},
+				},
+			},
+			want: map[string]UnavailableDB{
+				"down": {Config: DatabaseConfig{URL: "u2", Driver: "fake"}, Err: connectErr},
+			},
+		},
+		{
+			name: "returns every failed alias when all are down",
+			fields: fields{
+				dialects: map[string]Dialect{"fake": fd},
+				entries: map[string]*entry{
+					"a": {cfg: DatabaseConfig{URL: "u1", Driver: "fake"}, pool: nil, dialect: fd, connectErr: connectErr},
+					"b": {cfg: DatabaseConfig{URL: "u2", Driver: "fake"}, pool: nil, dialect: fd, connectErr: connectErr},
+				},
+			},
+			want: map[string]UnavailableDB{
+				"a": {Config: DatabaseConfig{URL: "u1", Driver: "fake"}, Err: connectErr},
+				"b": {Config: DatabaseConfig{URL: "u2", Driver: "fake"}, Err: connectErr},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Registry{dialects: tt.fields.dialects, entries: tt.fields.entries}
+			got := r.Unavailable()
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// --- Registry.Close (nil-pool safety) -----------------------------------
+
+func TestRegistry_Close(t *testing.T) {
+	fd := &fakeDialect{name: "fake"}
+
+	type fields struct {
+		dialects map[string]Dialect
+		entries  map[string]*entry
+	}
+	tests := []struct {
+		name    string
+		fields  fields
+		wantErr assert.ErrorAssertionFunc
+	}{
+		{
+			name: "mixed available and nil-pool entries close without panic",
+			fields: fields{
+				dialects: map[string]Dialect{"fake": fd},
+				entries: map[string]*entry{
+					"a":    {cfg: DatabaseConfig{URL: "u1", Driver: "fake"}, pool: fakePool(), dialect: fd},
+					"down": {cfg: DatabaseConfig{URL: "u2", Driver: "fake"}, pool: nil, dialect: fd, connectErr: errors.New("refused")},
+				},
+			},
+			wantErr: assert.NoError,
+		},
+		{
+			name: "only nil-pool entries close without panic",
+			fields: fields{
+				dialects: map[string]Dialect{"fake": fd},
+				entries: map[string]*entry{
+					"down": {cfg: DatabaseConfig{URL: "u1", Driver: "fake"}, pool: nil, dialect: fd, connectErr: errors.New("refused")},
+				},
+			},
+			wantErr: assert.NoError,
+		},
+		{
+			name: "empty registry closes cleanly",
+			fields: fields{
+				dialects: map[string]Dialect{"fake": fd},
+				entries:  map[string]*entry{},
+			},
+			wantErr: assert.NoError,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Registry{dialects: tt.fields.dialects, entries: tt.fields.entries}
+			err := r.Close()
+			tt.wantErr(t, err, fmt.Sprintf("Close()"))
 		})
 	}
 }
